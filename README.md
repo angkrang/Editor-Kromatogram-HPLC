@@ -142,8 +142,3 @@ Acknowledgements
 - Built with plain HTML/CSS/JavaScript. If this project uses any third-party libraries (e.g., charting libraries), mention them here with links.
 
 ---
-
-If you'd like I can:
-- Add a screenshot to the README (attach an image or point to one in the repo)
-- Create a `LICENSE` file with MIT text
-- Add usage examples or sample CSV files
