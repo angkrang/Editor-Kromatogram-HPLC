@@ -715,7 +715,7 @@ body.light .sidebar::-webkit-scrollbar-thumb { background: #9FB0BA; }
         <div class="card-title">Tabel Peak</div>
         <div class="peak-table-wrap">
           <table class="peaks">
-            <thead><tr><th>#</th><th>RT (min)</th><th>Tinggi</th><th>Luas (mAU·ms)</th><th></th></tr></thead>
+            <thead><tr><th>#</th><th>RT (min)</th><th>Nama / ID</th><th>Tinggi</th><th>Luas (mAU·ms)</th><th></th></tr></thead>
             <tbody id="peakTableBody"></tbody>
           </table>
         </div>
@@ -806,6 +806,7 @@ function freshState(){
     original: [], current: [], peaks: [], manualPeaks: [],
     selectedPeak: null, dragRange: null, baselinePreview: null,
     showOriginal: false, history: [], sensitivity: 3, baselineWindow: 2.5,
+    refPeaks: [], // tabel peak resmi (Name/ID/Conc/Mark) hasil import dari [Peak Table] LabSolutions, dicocokkan ke peak terdeteksi berdasarkan R.Time terdekat
   };
 }
 function freshView(){ return {tMin:0, tMax:30}; }
@@ -954,6 +955,7 @@ function buildStateFromPairs(pairs, divideBy1000){
 // untuk dataset yang ujung-ujungnya bukan dataset aktif.
 function addDatasetSilent(name, pairs, divideBy1000, info){
   const newState = buildStateFromPairs(pairs, divideBy1000);
+  if(info && info.refPeaks && info.refPeaks.length) newState.refPeaks = info.refPeaks;
   const newView = freshView();
   newView.tMin = newState.current[0].t;
   newView.tMax = newState.current[newState.current.length-1].t;
@@ -1719,6 +1721,73 @@ function parseLabSolutionsSheet(rows){
   return blocks;
 }
 
+// Pindai satu sheet (rows) dan kembalikan SEMUA tabel "[Peak Table(...)]" resmi
+// dari LabSolutions (Name, ID#, Conc., Mark per peak) — ini dipakai sebagai
+// referensi yang dicocokkan ke peak HASIL DETEKSI ulang aplikasi berdasarkan
+// R.Time terdekat, supaya kolom Nama/ID/Mark ikut tampil & otomatis menyesuaikan
+// setiap kali kromatogram diedit (merge/split/hapus/baseline dll memicu redetect()
+// -> renderPeakTable() yang mencocokkan ulang).
+function parsePeakTableSection(rows){
+  const tables = [];
+  for(let i=0;i<rows.length;i++){
+    const r = rows[i];
+    if(!r || typeof r[0] !== 'string') continue;
+    if(!/^\[Peak Table/i.test(r[0].toString().trim())) continue;
+
+    const bracket = (r[0].match(/\(([^)]+)\)/)||[])[1] || null; // mis. "PDA-Ch1"
+    let channelLabel = null;
+    if(bracket){
+      const m = bracket.match(/Ch\s*\d+/i);
+      channelLabel = m ? m[0].replace(/\s+/,'').replace(/ch/i,'Ch') : bracket;
+    }
+
+    // Cari baris header "Peak#,R.Time,..." dalam beberapa baris ke depan
+    // (biasanya tepat 2 baris setelah "[Peak Table...]", melewati "# of Peaks")
+    let j = i+1, headerRow = -1;
+    while(j < rows.length && j - i <= 5){
+      const cell0 = rows[j] && rows[j][0];
+      if(typeof cell0 === 'string' && cell0.toString().trim().toLowerCase() === 'peak#'){ headerRow = j; break; }
+      j++;
+    }
+    if(headerRow === -1) continue;
+
+    const header = rows[headerRow].map(h => (h===undefined||h===null) ? '' : h.toString().trim().toLowerCase());
+    const col = {
+      rtime: header.indexOf('r.time'),
+      height: header.indexOf('height'),
+      area: header.indexOf('area'),
+      conc: header.indexOf('conc.'),
+      mark: header.indexOf('mark'),
+      id: header.indexOf('id#'),
+      name: header.indexOf('name'),
+    };
+    if(col.rtime === -1) continue; // header tidak dikenali, lewati
+
+    const peaks = [];
+    let k = headerRow + 1;
+    while(k < rows.length){
+      const row = rows[k];
+      if(!row || row[0]===undefined || row[0]===null || row[0]==='' || typeof row[0] !== 'number') break;
+      const get = ix => ix>=0 ? row[ix] : undefined;
+      const rtime = parseFloat(get(col.rtime));
+      if(!Number.isFinite(rtime)){ k++; continue; }
+      const idVal = get(col.id), nameVal = get(col.name);
+      peaks.push({
+        rtime,
+        height: parseFloat(get(col.height)),
+        area: parseFloat(get(col.area)),
+        conc: get(col.conc)!==undefined && get(col.conc)!==null && get(col.conc)!=='' ? parseFloat(get(col.conc)) : null,
+        mark: get(col.mark)!==undefined && get(col.mark)!==null ? String(get(col.mark)).trim() : '',
+        id: (idVal!==undefined && idVal!==null && idVal!=='') ? String(idVal).trim() : '',
+        name: (nameVal!==undefined && nameVal!==null && nameVal!=='') ? String(nameVal).trim() : '',
+      });
+      k++;
+    }
+    if(peaks.length) tables.push({ channelLabel, peaks });
+  }
+  return tables;
+}
+
 
 /* =========================================================================
    LCD PARSER — Shimadzu LabSolutions native binary format
@@ -1882,6 +1951,7 @@ function handleFile(file){
           const ws = wb.Sheets[sheetName];
           const rows = XLSX.utils.sheet_to_json(ws, {header:1, raw:true});
           const blocks = parseLabSolutionsSheet(rows);
+          const peakTables = parsePeakTableSection(rows);
           const multiChannel = blocks.length > 1;
           let foundInSheet = 0;
 
@@ -1895,10 +1965,18 @@ function handleFile(file){
             if(multiSheet) dsName += ' — ' + sheetName;
             if(multiChannel) dsName += ' (' + (block.channelLabel || ('Channel ' + (blockIdx+1))) + ')';
 
+            // Cocokkan tabel peak resmi [Peak Table(...)] ke channel kromatogram ini —
+            // berdasarkan label channel (mis. "Ch1"); jika cuma ada satu tabel peak
+            // di sheet ini, pakai itu saja (umum terjadi pada export 1 channel).
+            let matchedTable = peakTables.find(pt => pt.channelLabel && block.channelLabel &&
+              pt.channelLabel.toLowerCase() === block.channelLabel.toLowerCase());
+            if(!matchedTable && peakTables.length === 1) matchedTable = peakTables[0];
+            const refPeaks = matchedTable ? matchedTable.peaks : [];
+
             // addDatasetSilent: TIDAK langsung redetect/draw/render menu — penting saat
             // sheet berjumlah banyak (puluhan), supaya browser tidak macet mengerjakan
             // deteksi peak untuk dataset yang ujungnya tidak langsung dilihat user.
-            const entry = addDatasetSilent(dsName, block.pairs, block.divideBy1000, { sheet: sheetName, channel: block.channelLabel || null });
+            const entry = addDatasetSilent(dsName, block.pairs, block.divideBy1000, { sheet: sheetName, channel: block.channelLabel || null, refPeaks });
             addedEntries.push(entry);
             totalPoints += block.pairs.length;
             foundInSheet++;
@@ -2476,14 +2554,42 @@ canvas.addEventListener('touchend', e => {
 function renderPeakTable(){
   const tbody = document.getElementById('peakTableBody');
   if(!state.peaks.length){
-    tbody.innerHTML = '<tr><td colspan="5"><div class="empty-state">Tidak ada peak terdeteksi pada sensitivitas ini</div></td></tr>';
+    tbody.innerHTML = '<tr><td colspan="6"><div class="empty-state">Tidak ada peak terdeteksi pada sensitivitas ini</div></td></tr>';
     return;
   }
+  // Cocokkan tiap peak hasil deteksi/edit ke tabel peak resmi (refPeaks, dari
+  // [Peak Table] LabSolutions) berdasarkan R.Time terdekat. Dijalankan ULANG
+  // setiap kali tabel di-render (artinya: setiap kali kromatogram berubah —
+  // merge/split/hapus/baseline/peak manual) sehingga Nama/ID/Mark otomatis
+  // ikut menyesuaikan posisi peak yang baru, bukan menempel pada index lama.
+  const refPool = (state.refPeaks || []).slice();
+  const tol = 0.15; // toleransi pencocokan R.Time, menit
+  const matches = state.peaks.map(p => {
+    let best = null, bestD = Infinity;
+    for(const ref of refPool){
+      const d = Math.abs(ref.rtime - p.apexT);
+      if(d < bestD){ bestD = d; best = ref; }
+    }
+    if(best && bestD <= tol){
+      refPool.splice(refPool.indexOf(best), 1); // 1 ref hanya dipakai sekali, hindari dobel-match
+      return best;
+    }
+    return null;
+  });
+
   tbody.innerHTML = state.peaks.map((p, idx) => {
     const selected = state.selectedPeak && Math.abs(state.selectedPeak.apexT-p.apexT)<1e-6;
+    const ref = matches[idx];
+    let nameCell = '<span style="color:var(--text-dim)">—</span>';
+    if(ref){
+      const label = ref.name || ref.id || '';
+      nameCell = label ? escapeHtml(label) : '<span style="color:var(--text-dim)">—</span>';
+      if(ref.mark && ref.mark.trim()) nameCell += ' <span style="color:var(--text-dim);font-size:9.5px;">' + escapeHtml(ref.mark.trim()) + '</span>';
+    }
     return `<tr class="peak-row${selected?' selected':''}" data-idx="${idx}">
       <td><span class="num-chip">${idx+1}</span></td>
       <td>${p.apexT.toFixed(3)}${p.manual ? ' <span title="Ditambahkan manual" style="color:var(--text-dim);font-size:9.5px;">✎</span>' : ''}</td>
+      <td>${nameCell}</td>
       <td>${p.height.toFixed(2)}</td>
       <td>${p.area.toFixed(0)}</td>
       <td><button class="del-btn" data-idx="${idx}" title="Hapus peak ini">✕</button></td>
@@ -2601,9 +2707,21 @@ function exportCsv(){
 }
 
 function exportPeaks(){
-  let out = 'No,RT(min),Tinggi(mAU),Luas,Lebar(min)\n';
+  const refPool = (state.refPeaks || []).slice();
+  const tol = 0.15;
+  let out = 'No,RT(min),Nama,ID,Tinggi(mAU),Luas,Lebar(min)\n';
   state.peaks.forEach((p,idx)=>{
-    out += (idx+1)+','+p.apexT.toFixed(3)+','+p.height.toFixed(2)+','+p.area.toFixed(0)+','+p.width.toFixed(3)+'\n';
+    let best = null, bestD = Infinity;
+    for(const ref of refPool){
+      const d = Math.abs(ref.rtime - p.apexT);
+      if(d < bestD){ bestD = d; best = ref; }
+    }
+    let name = '', id = '';
+    if(best && bestD <= tol){
+      name = best.name || ''; id = best.id || '';
+      refPool.splice(refPool.indexOf(best), 1);
+    }
+    out += (idx+1)+','+p.apexT.toFixed(3)+',"'+name.replace(/"/g,'""')+'","'+id.replace(/"/g,'""')+'",'+p.height.toFixed(2)+','+p.area.toFixed(0)+','+p.width.toFixed(3)+'\n';
   });
   downloadBlob('tabel_peak.csv', out);
   showToast("Tabel peak diunduh sebagai CSV");
